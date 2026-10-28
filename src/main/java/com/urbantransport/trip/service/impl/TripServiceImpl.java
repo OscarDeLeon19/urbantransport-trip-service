@@ -7,6 +7,7 @@ import com.urbantransport.trip.client.FleetRouteResponse;
 import com.urbantransport.trip.client.TicketingClient;
 import com.urbantransport.trip.client.TicketingSoldSummaryResponse;
 import com.urbantransport.trip.config.TripProperties;
+import com.urbantransport.trip.domain.ProcessedEventEntity;
 import com.urbantransport.trip.domain.TripArrivalEntity;
 import com.urbantransport.trip.domain.TripDepartureEntity;
 import com.urbantransport.trip.domain.TripEntity;
@@ -23,12 +24,15 @@ import com.urbantransport.trip.dto.TripDetailResponse;
 import com.urbantransport.trip.dto.TripResponse;
 import com.urbantransport.trip.dto.UpdateTripRequest;
 import com.urbantransport.trip.event.EventTypes;
+import com.urbantransport.trip.event.PrivateTripRejectedPayload;
+import com.urbantransport.trip.event.RentalAssignedPayload;
 import com.urbantransport.trip.event.TripCompletedPayload;
 import com.urbantransport.trip.event.TripDeletedPayload;
 import com.urbantransport.trip.event.TripEventPayload;
 import com.urbantransport.trip.event.TripStartedPayload;
 import com.urbantransport.trip.exception.ApiException;
 import com.urbantransport.trip.exception.ErrorCodes;
+import com.urbantransport.trip.repository.ProcessedEventRepository;
 import com.urbantransport.trip.repository.TripArrivalRepository;
 import com.urbantransport.trip.repository.TripDepartureRepository;
 import com.urbantransport.trip.repository.TripRepository;
@@ -36,6 +40,7 @@ import com.urbantransport.trip.repository.TripSpecifications;
 import com.urbantransport.trip.service.OutboxService;
 import com.urbantransport.trip.service.TripService;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
@@ -55,6 +60,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class TripServiceImpl implements TripService {
@@ -76,6 +82,7 @@ public class TripServiceImpl implements TripService {
     private final TicketingClient ticketingClient;
     private final TransactionTemplate transactionTemplate;
     private final TripProperties tripProperties;
+    private final ProcessedEventRepository processedEventRepository;
 
     @Value("${app.zone:America/Guatemala}")
     private ZoneId zone;
@@ -123,6 +130,88 @@ public class TripServiceImpl implements TripService {
         });
 
         return TripResponse.fromEntity(trip);
+    }
+
+    @Override
+    public void createPrivateFromRental(UUID eventId, String eventType, RentalAssignedPayload payload) {
+        if (processedEventRepository.existsById(eventId)) {
+            log.debug("Evento {} ya procesado, se ignora", eventId);
+            return;
+        }
+        if (payload == null || payload.rentalId() == null || payload.legs() == null || payload.legs().isEmpty()) {
+            throw new IllegalArgumentException("RentalAssigned " + eventId + " sin rentalId o sin tramos");
+        }
+
+        try {
+            FleetBusResponse bus = fleetClient.getBus(payload.busId());
+            validateBus(bus, payload.branchId());
+            validateCapacity(bus, payload.passengers());
+
+            FleetDriverResponse driver = fleetClient.getDriver(payload.driverId());
+            validateDriver(driver, payload.branchId(), payload.legs().getLast().estimatedArrival());
+
+            transactionTemplate.executeWithoutResult(status -> {
+                if (processedEventRepository.existsById(eventId)) {
+                    return;
+                }
+                lockResources(bus.id(), driver.id());
+                for (RentalAssignedPayload.Leg leg : payload.legs()) {
+                    assertNoOverlap(null, bus.id(), driver.id(), leg.departureAt(), leg.estimatedArrival());
+
+                    TripEntity saved = tripRepository.save(TripEntity.builder()
+                            .type(TripType.PRIVATE)
+                            .originBranchId(payload.branchId())
+                            .originText(leg.originText())
+                            .destinationText(leg.destinationText())
+                            .busId(bus.id())
+                            .driverId(driver.id())
+                            .scheduledDeparture(leg.departureAt())
+                            .estimatedArrival(leg.estimatedArrival())
+                            .distanceKm(payload.distanceKm())
+                            .status(TripStatus.SCHEDULED)
+                            .rentalId(payload.rentalId())
+                            .createdBy(payload.assignedBy())
+                            .build());
+
+                    outboxService.record(EventTypes.AGGREGATE_TRIP, saved.getId(), EventTypes.TRIP_SCHEDULED,
+                            TripEventPayload.from(saved, null, bus, zone));
+                }
+                markProcessed(eventId, eventType);
+            });
+        } catch (ApiException exception) {
+            if (exception.getStatus().is5xxServerError()) {
+                throw exception;
+            }
+            rejectPrivateTrip(eventId, eventType, payload, exception);
+        }
+    }
+
+    private void rejectPrivateTrip(UUID eventId, String eventType, RentalAssignedPayload payload,
+                                   ApiException cause) {
+        log.info("Viaje privado del alquiler {} rechazado: {}", payload.rentalId(), cause.getMessage());
+        transactionTemplate.executeWithoutResult(status -> {
+            if (processedEventRepository.existsById(eventId)) {
+                return;
+            }
+            outboxService.record(EventTypes.AGGREGATE_TRIP, payload.rentalId(), EventTypes.PRIVATE_TRIP_REJECTED,
+                    PrivateTripRejectedPayload.from(payload, cause));
+            markProcessed(eventId, eventType);
+        });
+    }
+
+    private void validateCapacity(FleetBusResponse bus, Integer passengers) {
+        if (passengers != null && bus.capacity() < passengers) {
+            throw new ApiException(HttpStatus.UNPROCESSABLE_CONTENT, ErrorCodes.BUS_CAPACITY_EXCEEDED,
+                    "El bus " + bus.plate() + " tiene " + bus.capacity() + " asientos y el alquiler es para "
+                            + passengers + " pasajeros");
+        }
+    }
+
+    private void markProcessed(UUID eventId, String eventType) {
+        processedEventRepository.save(ProcessedEventEntity.builder()
+                .eventId(eventId)
+                .eventType(eventType)
+                .build());
     }
 
     @Override

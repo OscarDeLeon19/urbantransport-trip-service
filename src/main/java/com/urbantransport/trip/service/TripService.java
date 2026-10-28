@@ -11,6 +11,7 @@ import com.urbantransport.trip.dto.TripDepartureResponse;
 import com.urbantransport.trip.dto.TripDetailResponse;
 import com.urbantransport.trip.dto.TripResponse;
 import com.urbantransport.trip.dto.UpdateTripRequest;
+import com.urbantransport.trip.event.RentalAssignedPayload;
 
 import java.time.LocalDate;
 import java.util.UUID;
@@ -46,4 +47,6 @@ public interface TripService {
     TripCountResponse countActive(UUID busId, UUID driverId);
 
     TripCountResponse countByRoute(UUID routeId);
+
+    void createPrivateFromRental(UUID eventId, String eventType, RentalAssignedPayload payload);
 }

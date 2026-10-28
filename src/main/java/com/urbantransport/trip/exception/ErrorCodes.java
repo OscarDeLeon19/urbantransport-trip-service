@@ -42,4 +42,5 @@ public final class ErrorCodes {
     public static final String LAYOUT_INCOMPATIBLE = "LAYOUT_INCOMPATIBLE";
     public static final String TICKETING_UNAVAILABLE = "TICKETING_UNAVAILABLE";
     public static final String TICKETING_ERROR = "TICKETING_ERROR";
+    public static final String BUS_CAPACITY_EXCEEDED = "BUS_CAPACITY_EXCEEDED";
 }
